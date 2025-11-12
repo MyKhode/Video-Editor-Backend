@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+pydantic>=2.0
+pydantic-settings
+python-dotenv
+pymysql
+requests
+httpx
+python-multipart
+Pillow
+moviepy
