@@ -1,0 +1,57 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+.Python
+
+# Environment and secrets
+.env
+.env.*
+
+# Build artifacts
+build/
+dist/
+downloads/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+.eggs/
+
+# Testing and coverage
+.pytest_cache/
+.mypy_cache/
+.coverage*
+coverage.xml
+htmlcov/
+.cache/
+
+# IDE/editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Local media/uploads
+media/
+uploads/
+
+# Alembic caches
+alembic/__pycache__/
+alembic/versions/__pycache__/
+
+# OS files
+.DS_Store
+Thumbs.db
