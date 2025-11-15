@@ -85,3 +85,10 @@ def find_asset_by_name_project_user(db: Session, user_id: str, project_id: str |
     if project_id is not None:
         q = q.filter(Asset.project_id == project_id)
     return q.order_by(desc(Asset.created_at)).first()
+
+
+def find_asset_by_storage_key(db: Session, user_id: str, project_id: str | None, storage_key: str):
+    q = db.query(Asset).filter(Asset.user_id == user_id, Asset.storage_key == storage_key)
+    if project_id is not None:
+        q = q.filter(Asset.project_id == project_id)
+    return q.order_by(desc(Asset.created_at)).first()

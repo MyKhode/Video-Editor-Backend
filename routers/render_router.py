@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from core.database import get_db
 from core.auth import get_current_user
+from core.config import settings
 import requests
 
 
@@ -19,7 +20,6 @@ def _compute_timeline_duration_seconds(timeline_tracks: List[Dict[str, Any]], pp
     max_end = 0.0
     for track in timeline_tracks or []:
         for s in track.get("scrubbers", []) or []:
-            # Only consider image/video for duration optimization
             mt = (s.get("mediaType") or "").lower()
             if mt not in ("image", "video"):
                 continue
@@ -40,6 +40,46 @@ def _download_to_temp(url: str, suffix: str = "") -> str:
             if chunk:
                 out.write(chunk)
     return path
+
+
+def _local_media_path_from_url(url: str) -> str | None:
+    try:
+        if settings.MEDIA_URL_PATH in url:
+            fname = os.path.basename(url)
+            candidate = os.path.join(settings.MEDIA_DIR, fname)
+            if os.path.exists(candidate):
+                return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_media_path(item: Dict[str, Any]) -> str | None:
+    url = (
+        item.get("mediaUrlRemote")
+        or item.get("mediaUrlLocal")
+        or item.get("src")
+        or item.get("url")
+        or None
+    )
+    if url:
+        print(f"[render] Resolving URL: {url}")
+        local = _local_media_path_from_url(url)
+        if local:
+            print(f"[render] Found local path: {local}")
+            return local
+        if not isinstance(url, str) or not url.startswith("http"):
+            return url
+        print(f"[render] Downloading from URL: {url}")
+        return url
+    name = item.get("name")
+    if name:
+        p = os.path.join(settings.MEDIA_DIR, name)
+        if os.path.exists(p):
+            print(f"[render] Found local file: {p}")
+            return p
+    print(f"[render] No valid media path found for item: {item}")
+    return None
 
 
 def _hex_to_rgb(hex_color: str, default=(255, 255, 255)):
@@ -72,7 +112,6 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"moviepy/ffmpeg not available: {e}")
 
-    # Compatibility helpers across MoviePy v1/v2 method changes
     def _with_duration(clip, duration: float):
         if hasattr(clip, "set_duration"):
             return clip.set_duration(duration)
@@ -95,7 +134,6 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
         return clip
 
     def _resize(clip, size):
-        # Prefer classic resize; otherwise fallback
         if hasattr(clip, "resize"):
             try:
                 return clip.resize(newsize=size)
@@ -105,38 +143,42 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
             return clip.with_size(size)
         return clip
 
-    timeline = payload.get("timelineData") or payload.get("timeline") or []
+    timeline_raw = payload.get("timelineData") or payload.get("timeline") or []
+    tracks = timeline_raw.get("tracks") if isinstance(timeline_raw, dict) else (timeline_raw or [])
     width = int(payload.get("compositionWidth") or 1920)
     height = int(payload.get("compositionHeight") or 1080)
-    # Prefer visualDurationInFrames, fallback to durationInFrames
     frames = int(payload.get("visualDurationInFrames") or payload.get("durationInFrames") or 0)
     pps = float(payload.get("getPixelsPerSecond") or 100.0)
 
-    # Determine duration: use provided frames if present; otherwise compute from timeline (image/video only)
     fps = int(payload.get("fps") or 30)
     fps = max(24, min(60, fps))
     timeline_seconds = 0.0
     if frames > 0:
         total_duration = max(1.0 / fps, frames / fps)
     else:
-        timeline_seconds = _compute_timeline_duration_seconds(timeline, pps)
+        timeline_seconds = _compute_timeline_duration_seconds(tracks, pps)
         total_duration = max(1.0 / fps, timeline_seconds or (1.0 * 10 / fps))
 
     base = _with_duration(ColorClip(size=(width, height), color=(0, 0, 0)), total_duration)
 
     clips = [base]
     audio_clips = []
+    audio_max_end = 0.0
 
-    # Tracks layering: assume earlier tracks are underneath; later are on top
-    for track in timeline or []:
-        for s in track.get("scrubbers", []) or []:
+    # Debug logs to track audio clips and media resolution
+    print(f"[render] Number of audio clips initially: {len(audio_clips)}")
+    for track in tracks:
+        for s in track.get("scrubbers", []):
             media_type = (s.get("mediaType") or "").lower()
-            url = s.get("mediaUrlRemote")
+            url = _resolve_media_path(s)
             if not url:
                 continue
 
+            print(f"[render] Resolving media path for {s.get('name')}: {url}")
+
             start = float(s.get("startTime") or (float(s.get("left", 0)) / pps if pps else 0))
             dur = float(s.get("duration") or (float(s.get("width", 0)) / pps if pps else 0))
+
             if dur <= 0:
                 continue
 
@@ -147,157 +189,88 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
             pos = (left, top)
 
             try:
-                if media_type == "image":
-                    # Prefetch to local file to improve stability
-                    local_path = _download_to_temp(url, suffix=os.path.splitext(url)[1]) if url.startswith("http") else url
-                    # Cap duration to project length
-                    end = min(start + dur, total_duration)
-                    new_dur = max(0.0, end - start)
-                    if new_dur <= 0:
-                        continue
-                    clip = ImageClip(local_path)
-                    clip = _with_duration(clip, new_dur)
-                    if w_px and h_px:
-                        clip = _resize(clip, (w_px, h_px))
-                    clip = _with_start(_with_position(clip, pos), start)
-                    clips.append(clip)
-                elif media_type == "video":
-                    local_path = _download_to_temp(url, suffix=os.path.splitext(url)[1]) if url.startswith("http") else url
-                    v = VideoFileClip(local_path)
-                    trim_before = s.get("trimBefore")
-                    # treat trimBefore ms if large value, else seconds
-                    if trim_before:
-                        tb = float(trim_before)
-                        if tb > 1000:
-                            tb = tb / 1000.0
-                        max_end = min(total_duration, tb + dur)
-                        v = v.subclip(tb, min(max_end, getattr(v, "duration", dur)))
-                    else:
-                        max_end = min(total_duration - start, dur)
-                        v = v.subclip(0, max(0.0, min(max_end, getattr(v, "duration", dur))))
-                    if w_px and h_px:
-                        v = _resize(v, (w_px, h_px))
-                    clip = _with_start(_with_position(v, pos), start)
-                    clips.append(clip)
-                    if getattr(v, "audio", None) is not None:
-                        a = v.audio
-                        if hasattr(a, "set_start"):
-                            a = a.set_start(start)
-                        elif hasattr(a, "with_start"):
-                            a = a.with_start(start)
-                        audio_clips.append(a)
-                elif media_type == "text":
-                    # Render text using PIL into an ImageClip
-                    t = s.get("text") or {}
-                    content = (
-                        t.get("textContent")
-                        or t.get("content")
-                        or t.get("value")
-                        or s.get("name")
-                        or ""
-                    )
-                    if not content:
-                        continue
-                    # Lazy import Pillow
+                if media_type == "audio":
+                    print(f"[render] Loading audio file: {url}")
                     try:
-                        from PIL import Image as PILImage, ImageDraw, ImageFont
-                        import numpy as np
-                    except Exception:
-                        continue
-                    w = w_px if w_px else max(200, int(0.3 * width))
-                    h = h_px if h_px else max(50, int(0.1 * height))
-                    bg = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
-                    draw = ImageDraw.Draw(bg)
-                    font_size = int(t.get("fontSize") or 32)
-                    font_family = t.get("fontFamily") or "Arial"
-                    # Try to load TTF; fallback to default
-                    try:
-                        font = ImageFont.truetype(font_family, font_size)
-                    except Exception:
-                        try:
-                            font = ImageFont.truetype("arial.ttf", font_size)
-                        except Exception:
-                            font = ImageFont.load_default()
-                    color = _hex_to_rgb(t.get("color") or "#ffffff")
-                    align = (t.get("textAlign") or "left").lower()
-                    # Simple multiline handling
-                    lines = str(content).split("\n")
-                    y = 0
-                    for line in lines:
-                        bbox = draw.textbbox((0, 0), line, font=font)
-                        tw = bbox[2] - bbox[0]
-                        th = bbox[3] - bbox[1]
-                        if align == "center":
-                            x = max(0, (w - tw) // 2)
-                        elif align == "right":
-                            x = max(0, w - tw)
+                        a = AudioFileClip(url)
+                        if a.duration > 0:
+                            print(f"[render] Audio clip loaded: {a.duration} seconds")
+                            audio_clips.append(a)
                         else:
-                            x = 0
-                        draw.text((x, y), line, font=font, fill=color + (255,))
-                        y += th
-                    arr = np.array(bg)
-                    end = min(start + dur, total_duration)
-                    new_dur = max(0.0, end - start)
-                    if new_dur <= 0:
-                        continue
-                    clip = ImageClip(arr)
-                    clip = _with_duration(clip, new_dur)
-                    clip = _with_start(_with_position(clip, pos), start)
-                    clips.append(clip)
-                elif media_type == "audio":
-                    url_a = s.get("mediaUrlRemote")
-                    if not url_a:
-                        continue
-                    local_path = _download_to_temp(url_a, suffix=os.path.splitext(url_a)[1]) if url_a.startswith("http") else url_a
+                            print(f"[render] Audio clip duration is non-positive: {url}")
+                    except Exception as e:
+                        print(f"[render] Error loading audio clip {url}: {e}")
+                elif media_type == "image":
+                    print(f"[render] Loading image file: {url}")
                     try:
-                        a = AudioFileClip(local_path)
-                    except Exception:
-                        continue
-                    trim_before = s.get("trimBefore")
-                    if trim_before:
-                        tb = float(trim_before)
-                        if tb > 1000:
-                            tb = tb / 1000.0
-                        a = a.subclip(tb, min(tb + dur, getattr(a, "duration", dur)))
-                    else:
-                        a = a.subclip(0, min(dur, getattr(a, "duration", dur)))
-                    if hasattr(a, "set_start"):
-                        a = a.set_start(start)
-                    elif hasattr(a, "with_start"):
-                        a = a.with_start(start)
-                    audio_clips.append(a)
+                        img_clip = ImageClip(url)
+                        img_clip = _with_duration(img_clip, dur)
+                        img_clip = _resize(img_clip, (w_px, h_px)) if w_px and h_px else img_clip
+                        img_clip = _with_position(img_clip, pos)
+                        img_clip = _with_start(img_clip, start)
+                        clips.append(img_clip)
+                        print(f"[render] Image clip loaded: {url}")
+                    except Exception as e:
+                        print(f"[render] Error loading image clip {url}: {e}")
                 else:
-                    continue
-            except Exception:
-                # Skip broken media entries
-                continue
+                    print(f"[render] Skipping non-audio/media type: {media_type}")
+            except Exception as e:
+                print(f"[render] Error processing scrubber: {e}")
 
-    comp = CompositeVideoClip(clips, size=(width, height))
+    # After processing all tracks, check if audio is added
+    print(f"[render] Number of audio clips: {len(audio_clips)}")
+
+    # Initialize comp (video composition) if no video clips were added
+    if not clips:
+        clips.append(base)
+
+    # Proceed with video creation if audio clips are available
     if audio_clips:
-        try:
-            comp.audio = CompositeAudioClip(audio_clips)
-        except Exception:
-            comp.audio = None
+        print(f"[render] Combining audio clips into final video...")
+        mixed_audio = CompositeAudioClip(audio_clips)
+        mixed_audio = mixed_audio.with_duration(total_duration)  # Corrected the method
+        comp = CompositeVideoClip(clips, size=(width, height))
+        comp = comp.with_audio(mixed_audio)  # Corrected the method to `with_audio`
+    else:
+        comp = CompositeVideoClip(clips, size=(width, height))
 
-    # Render to a temp mp4 file
     temp_dir = tempfile.mkdtemp(prefix="render_")
     out_path = os.path.join(temp_dir, "output.mp4")
     try:
+        print(f"[render] Rendering video with audio clips count: {len(audio_clips)}")
         comp.write_videofile(
             out_path,
             fps=fps,
             codec="libx264",
             audio_codec="aac",
+            audio=True,
+            audio_fps=44100,
+            temp_audiofile=os.path.join(temp_dir, "temp-audio.m4a"),
             bitrate="2500k",
             audio_bitrate="192k",
+            threads=0,
         )
-    except TypeError:
-        # Fallback for MoviePy versions with different signatures
-        comp.write_videofile(out_path, fps=fps)
+    except Exception as e:
+        try:
+            print(f"[render] Error with AAC codec, trying MP3 codec: {e}")
+            comp.write_videofile(
+                out_path,
+                fps=fps,
+                codec="libx264",
+                audio_codec="libmp3lame",
+                audio=True,
+                audio_fps=44100,
+                temp_audiofile=os.path.join(temp_dir, "temp-audio.mp3"),
+                bitrate="2500k",
+                audio_bitrate="192k",
+                threads=0,
+            )
+        except Exception as e2:
+            comp.close()
+            raise HTTPException(status_code=500, detail=f"Render failed (audio): {e2}")
     finally:
         comp.close()
 
-    # Stream back result
     def _file_iterator(path: str, chunk_size: int = 1024 * 1024):
         with open(path, "rb") as f:
             while True:
