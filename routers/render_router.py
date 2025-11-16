@@ -164,10 +164,30 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
     clips = [base]
     audio_clips = []
     audio_max_end = 0.0
+    visual_items: List[Dict[str, Any]] = []
 
     # Debug logs to track audio clips and media resolution
     print(f"[render] Number of audio clips initially: {len(audio_clips)}")
-    for track in tracks:
+    # Sort tracks so that higher-numbered tracks are on top.
+    def _track_num(t: Dict[str, Any]) -> int:
+        n = t.get("trackNumber")
+        try:
+            if n is not None:
+                return int(n)
+        except Exception:
+            pass
+        tid = str(t.get("id") or "")
+        if tid.startswith("track-"):
+            try:
+                return int(tid.split("-", 1)[1])
+            except Exception:
+                return 0
+        return 0
+
+    tracks_sorted = sorted(tracks or [], key=_track_num)
+    print(f"[render] Track order (bottom->top): {[(_track_num(t), t.get('id')) for t in tracks_sorted]}")
+
+    for track in tracks_sorted:
         for s in track.get("scrubbers", []):
             media_type = (s.get("mediaType") or "").lower()
             url = _resolve_media_path(s)
@@ -187,31 +207,53 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
             w_px = int(s.get("width_player", 0) or 0)
             h_px = int(s.get("height_player", 0) or 0)
             pos = (left, top)
+            track_index = 0
+            try:
+                track_index = int(s.get("trackIndex") or 0)
+            except Exception:
+                track_index = 0
 
             try:
                 if media_type == "audio":
                     print(f"[render] Loading audio file: {url}")
                     try:
                         a = AudioFileClip(url)
-                        if a.duration > 0:
-                            print(f"[render] Audio clip loaded: {a.duration} seconds")
-                            audio_clips.append(a)
-                        else:
-                            print(f"[render] Audio clip duration is non-positive: {url}")
+
+                        # Timeline from frontend
+                        start = float(s.get("startTime", 0))
+                        requested_dur = float(s.get("duration", a.duration))
+
+                        # CLAMP duration to avoid reading out-of-range
+                        safe_duration = min(requested_dur, a.duration)
+
+                        print(f"[render] Audio timing → start={start}, duration={safe_duration} (requested={requested_dur}, actual={a.duration})")
+
+                        # Trim using with_duration() (MoviePy v2)
+                        a = a.with_duration(safe_duration)
+
+                        # Apply start time
+                        a = a.with_start(start)
+
+                        audio_clips.append(a)
+
                     except Exception as e:
                         print(f"[render] Error loading audio clip {url}: {e}")
+
+
+
                 elif media_type == "image":
-                    print(f"[render] Loading image file: {url}")
-                    try:
-                        img_clip = ImageClip(url)
-                        img_clip = _with_duration(img_clip, dur)
-                        img_clip = _resize(img_clip, (w_px, h_px)) if w_px and h_px else img_clip
-                        img_clip = _with_position(img_clip, pos)
-                        img_clip = _with_start(img_clip, start)
-                        clips.append(img_clip)
-                        print(f"[render] Image clip loaded: {url}")
-                    except Exception as e:
-                        print(f"[render] Error loading image clip {url}: {e}")
+                    # Defer creating clip; layer order will be applied by trackIndex.
+                    visual_items.append({
+                        "type": "image",
+                        "url": url,
+                        "start": start,
+                        "dur": dur,
+                        "pos": pos,
+                        "size": (w_px, h_px),
+                        "trackIndex": track_index,
+                        "name": s.get("name"),
+                    })
+                    print(f"[render] Queued image for layering: idx={track_index} url={url}")
                 else:
                     print(f"[render] Skipping non-audio/media type: {media_type}")
             except Exception as e:
@@ -219,6 +261,22 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
 
     # After processing all tracks, check if audio is added
     print(f"[render] Number of audio clips: {len(audio_clips)}")
+
+    # Sort and realize visual items according to trackIndex bottom->top
+    visual_items_sorted = sorted(visual_items, key=lambda x: int(x.get("trackIndex", 0)), reverse=True)
+    print("[render] Visual layering order (top->bottom):", [(v.get("trackIndex"), v.get("name")) for v in visual_items_sorted])
+    for v in visual_items_sorted:
+        try:
+            if v["type"] == "image":
+                img_clip = ImageClip(v["url"])
+                img_clip = _with_duration(img_clip, v["dur"])
+                w_px, h_px = v["size"]
+                img_clip = _resize(img_clip, (w_px, h_px)) if w_px and h_px else img_clip
+                img_clip = _with_position(img_clip, v["pos"])
+                img_clip = _with_start(img_clip, v["start"])
+                clips.append(img_clip)
+        except Exception as e:
+            print(f"[render] Error building visual clip {v.get('name')}: {e}")
 
     # Initialize comp (video composition) if no video clips were added
     if not clips:
