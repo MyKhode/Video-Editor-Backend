@@ -8,8 +8,7 @@ from sqlalchemy.orm import Session
 from core.auth import get_current_user
 from core.database import get_db
 from core.config import settings
-from crud.asset_crud import create_asset, find_asset_by_name_project_user, find_asset_by_storage_key, delete_asset
-from schemas.asset_schema import AssetResponse, AssetCreate
+from crud.asset_crud import find_asset_by_name_project_user, delete_asset
 from pydantic import BaseModel
 
 
@@ -43,12 +42,8 @@ def upload_media(
     filename = _normalize_filename(original_client_name)
     file_path = os.path.join(settings.MEDIA_DIR, filename)
 
-    # Duplicate check: if same storage_key exists for this user (any project) or on disk
-    try:
-        existing = find_asset_by_storage_key(db, current_user.id, None, filename)
-    except Exception:
-        existing = None
-    if existing is not None or os.path.exists(file_path):
+    # Duplicate check: if file already exists on disk
+    if os.path.exists(file_path):
         raise HTTPException(status_code=409, detail="Duplicate media")
 
     # Stream to disk to avoid high memory usage
@@ -104,25 +99,18 @@ def upload_media(
         # If compression fails, keep original file
         pass
 
-    # Persist asset record
-    payload = AssetCreate(
-        user_id=current_user.id,
-        project_id=project_id,
-        original_name=media.filename or filename,
-        storage_key=filename,
-        mime_type=mime,
-        size_bytes=size_bytes,
-        width=width,
-        height=height,
-    )
-    asset = create_asset(db, payload)
-
     # Build absolute URL for the saved media
     media_url = str(request.base_url).rstrip("/") + settings.MEDIA_URL_PATH + "/" + filename
 
+    # Do not create Asset rows anymore. The client should store this in project.timeline.
     return {
         "url": media_url,
-        "asset": AssetResponse.model_validate(asset),
+        "name": filename,
+        "mime_type": mime,
+        "size_bytes": size_bytes,
+        "width": width,
+        "height": height,
+        "project_id": project_id,
     }
 
 
@@ -171,26 +159,23 @@ def split_media(
     current_user = Depends(get_current_user),
 ):
     """
-    Split an audio/video asset into two files at split_time (seconds).
-    Creates two new assets, optionally deletes original. Returns new asset URLs.
+    Split an audio/video file into two files at split_time (seconds).
+    No Asset rows are created; returns URLs for the two outputs.
     """
-    # Locate asset
-    asset = None
-    if body.storage_key:
-        asset = find_asset_by_storage_key(db, current_user.id, body.project_id, body.storage_key)
-    if not asset and body.name:
-        asset = find_asset_by_name_project_user(db, current_user.id, body.project_id, body.name)
-    if not asset:
-        raise HTTPException(status_code=404, detail="Source media not found")
-
-    src_path = os.path.join(settings.MEDIA_DIR, asset.storage_key)
+    # Locate source by provided storage_key or name directly on disk
+    src_name = body.storage_key or body.name
+    if not src_name:
+        raise HTTPException(status_code=400, detail="Provide storage_key or name")
+    src_name = os.path.basename(src_name)
+    src_path = os.path.join(settings.MEDIA_DIR, src_name)
     if not os.path.exists(src_path):
         raise HTTPException(status_code=404, detail="Source file missing on server")
 
     # Determine media type
-    mime = asset.mime_type or ""
-    is_video = mime.startswith("video/") or asset.storage_key.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
-    is_audio = mime.startswith("audio/") or asset.storage_key.lower().endswith((".mp3", ".wav", ".aac", ".m4a", ".ogg"))
+    import mimetypes
+    guessed_mime = mimetypes.guess_type(src_name)[0] or ""
+    is_video = guessed_mime.startswith("video/") or src_name.lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+    is_audio = guessed_mime.startswith("audio/") or src_name.lower().endswith((".mp3", ".wav", ".aac", ".m4a", ".ogg"))
     if not (is_video or is_audio):
         raise HTTPException(status_code=400, detail="Only audio/video splitting is supported")
 
@@ -199,7 +184,7 @@ def split_media(
         raise HTTPException(status_code=400, detail="split_time must be > 0")
 
     # Prepare output filenames
-    base, ext = os.path.splitext(asset.storage_key)
+    base, ext = os.path.splitext(src_name)
     # Normalize output extension
     if is_video and ext.lower() not in (".mp4",):
         ext = ".mp4"
@@ -291,62 +276,40 @@ def split_media(
                 pass
         raise HTTPException(status_code=500, detail=f"Split failed: {e}")
 
-    # Persist assets
+    # Prepare response metadata
     def _guess_mime(filename: str) -> str:
         import mimetypes
         return mimetypes.guess_type(filename)[0] or ("video/mp4" if filename.endswith(".mp4") else "application/octet-stream")
-
     url_base = str(request.base_url).rstrip("/") + settings.MEDIA_URL_PATH + "/"
     out1_size = os.path.getsize(out1_path) if os.path.exists(out1_path) else 0
     out2_size = os.path.getsize(out2_path) if os.path.exists(out2_path) else 0
 
-    asset1 = create_asset(
-        db,
-        AssetCreate(
-            user_id=current_user.id,
-            project_id=asset.project_id,
-            original_name=os.path.basename(out1_name),
-            storage_key=out1_name,
-            mime_type=_guess_mime(out1_name),
-            size_bytes=out1_size,
-            width=width if is_video else None,
-            height=height if is_video else None,
-            duration_seconds=dur1,
-        ),
-    )
-    asset2 = create_asset(
-        db,
-        AssetCreate(
-            user_id=current_user.id,
-            project_id=asset.project_id,
-            original_name=os.path.basename(out2_name),
-            storage_key=out2_name,
-            mime_type=_guess_mime(out2_name),
-            size_bytes=out2_size,
-            width=width if is_video else None,
-            height=height if is_video else None,
-            duration_seconds=dur2,
-        ),
-    )
-
     # Optionally delete original
     if not body.keep_original:
         try:
-            file_path = os.path.join(settings.MEDIA_DIR, asset.storage_key)
+            file_path = os.path.join(settings.MEDIA_DIR, src_name)
             if os.path.exists(file_path):
                 os.remove(file_path)
         except Exception:
             pass
-        delete_asset(db, asset.id)
-
     return {
         "left": {
             "url": url_base + out1_name,
-            "asset": AssetResponse.model_validate(asset1),
+            "name": out1_name,
+            "mime_type": _guess_mime(out1_name),
+            "size_bytes": out1_size,
+            "width": width if is_video else None,
+            "height": height if is_video else None,
+            "duration_seconds": dur1,
         },
         "right": {
             "url": url_base + out2_name,
-            "asset": AssetResponse.model_validate(asset2),
+            "name": out2_name,
+            "mime_type": _guess_mime(out2_name),
+            "size_bytes": out2_size,
+            "width": width if is_video else None,
+            "height": height if is_video else None,
+            "duration_seconds": dur2,
         },
     }
 
@@ -506,35 +469,6 @@ def split_media_by_id(
     out1_size = os.path.getsize(out1_path) if os.path.exists(out1_path) else 0
     out2_size = os.path.getsize(out2_path) if os.path.exists(out2_path) else 0
 
-    asset1 = create_asset(
-        db,
-        AssetCreate(
-            user_id=current_user.id,
-            project_id=target_project_id,
-            original_name=os.path.basename(out1_name),
-            storage_key=out1_name,
-            mime_type=_guess_mime(out1_name),
-            size_bytes=out1_size,
-            width=width if is_video else None,
-            height=height if is_video else None,
-            duration_seconds=dur1,
-        ),
-    )
-    asset2 = create_asset(
-        db,
-        AssetCreate(
-            user_id=current_user.id,
-            project_id=target_project_id,
-            original_name=os.path.basename(out2_name),
-            storage_key=out2_name,
-            mime_type=_guess_mime(out2_name),
-            size_bytes=out2_size,
-            width=width if is_video else None,
-            height=height if is_video else None,
-            duration_seconds=dur2,
-        ),
-    )
-
     if not body.keep_original:
         try:
             file_path = os.path.join(settings.MEDIA_DIR, asset.storage_key)
@@ -546,6 +480,6 @@ def split_media_by_id(
 
     return {
         "ok": True,
-        "left": {"url": url_base + out1_name, "asset": AssetResponse.model_validate(asset1)},
-        "right": {"url": url_base + out2_name, "asset": AssetResponse.model_validate(asset2)},
+        "left": {"url": url_base + out1_name, "name": out1_name, "mime_type": _guess_mime(out1_name), "size_bytes": out1_size, "width": width if is_video else None, "height": height if is_video else None, "duration_seconds": dur1},
+        "right": {"url": url_base + out2_name, "name": out2_name, "mime_type": _guess_mime(out2_name), "size_bytes": out2_size, "width": width if is_video else None, "height": height if is_video else None, "duration_seconds": dur2},
     }

@@ -239,7 +239,21 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
                     except Exception as e:
                         print(f"[render] Error loading audio clip {url}: {e}")
 
-
+                elif media_type == "video":
+                    # Defer creating clip; layer order will be applied by trackIndex.
+                    visual_items.append({
+                        "type": "video",
+                        "url": url,
+                        "start": start,
+                        "dur": dur,
+                        "pos": pos,
+                        "size": (w_px, h_px),
+                        "trackIndex": track_index,
+                        "name": s.get("name"),
+                        "trimBefore": float(s.get("trimBefore") or 0),
+                        "trimAfter": float(s.get("trimAfter") or 0),
+                    })
+                    print(f"[render] Queued video for layering: idx={track_index} url={url}")
 
                 elif media_type == "image":
                     # Defer creating clip; layer order will be applied by trackIndex.
@@ -275,8 +289,57 @@ def render_video(payload: Dict[str, Any], current_user=Depends(get_current_user)
                 img_clip = _with_position(img_clip, v["pos"])
                 img_clip = _with_start(img_clip, v["start"])
                 clips.append(img_clip)
+            elif v["type"] == "video":
+                vid_clip = VideoFileClip(v["url"])  # load once
+                # Apply trimming if provided
+                t_before = float(v.get("trimBefore") or 0.0)
+                t_after = float(v.get("trimAfter") or 0.0)
+                vdur = float(v.get("dur") or 0.0)
+
+                # Compute safe subclip window
+                clip_total = float(getattr(vid_clip, "duration", vdur) or vdur or 0.0)
+                start_in = max(0.0, t_before)
+                end_in = max(0.0, clip_total - max(0.0, t_after))
+                if end_in > start_in:
+                    try:
+                        vid_clip = vid_clip.subclip(start_in, end_in)
+                    except Exception:
+                        # Fallback to duration clamp if subclip not available
+                        safe_dur = max(0.0, end_in - start_in)
+                        vid_clip = _with_duration(vid_clip, safe_dur)
+
+                # Clamp to requested timeline duration
+                if vdur:
+                    try:
+                        vid_clip = vid_clip.with_duration(min(vdur, getattr(vid_clip, "duration", vdur)))
+                    except Exception:
+                        vid_clip = _with_duration(vid_clip, min(vdur, getattr(vid_clip, "duration", vdur)))
+
+                # Resize and position
+                w_px, h_px = v["size"]
+                vid_clip = _resize(vid_clip, (w_px, h_px)) if w_px and h_px else vid_clip
+                vid_clip = _with_position(vid_clip, v["pos"]) if v.get("pos") else vid_clip
+                vid_clip = _with_start(vid_clip, v["start"]) if v.get("start") is not None else vid_clip
+                clips.append(vid_clip)
+
+                # Include the video's audio in the mix if present
+                try:
+                    if getattr(vid_clip, "audio", None) is not None:
+                        v_audio = vid_clip.audio
+                        v_audio = _with_start(v_audio, v["start"]) if v.get("start") is not None else v_audio
+                        # Ensure audio duration does not exceed clip duration
+                        try:
+                            v_audio = v_audio.with_duration(getattr(vid_clip, "duration", None))
+                        except Exception:
+                            v_audio = _with_duration(v_audio, getattr(vid_clip, "duration", None))
+                        audio_clips.append(v_audio)
+                except Exception as _e_audio:
+                    print(f"[render] Skipping video audio for {v.get('name')}: {_e_audio}")
         except Exception as e:
             print(f"[render] Error building visual clip {v.get('name')}: {e}")
+
+    # Log updated audio clips after extracting from videos
+    print(f"[render] Total audio clips after video extraction: {len(audio_clips)}")
 
     # Initialize comp (video composition) if no video clips were added
     if not clips:
